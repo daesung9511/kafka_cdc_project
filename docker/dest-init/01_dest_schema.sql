@@ -1,0 +1,11 @@
+DROP TABLE IF EXISTS employees CASCADE;
+
+CREATE TABLE employees (
+   emp_id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+   first_name VARCHAR(100),
+   last_name VARCHAR(100),
+   dob DATE,
+   city VARCHAR(100),
+   salary INT,
+   synced_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
