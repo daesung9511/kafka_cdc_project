@@ -1,5 +1,5 @@
-import abc
-import time
+import select
+import psycopg2.extensions
 
 from kafka import KafkaProducer
 from sqlalchemy import text
@@ -16,11 +16,7 @@ class EmployeeCDCProducer:
         self.producer = KafkaProducer(**KAFKA_PRODUCER_CONFIG)
         self.topic = KAFKA_TOPIC
 
-    def run(self):
-        print(f"Connecting to Kafka: {self.get_latest_cdc_id()}")
-        while True:
-            self.publish_batch()
-            time.sleep(1)
+
 
     def get_latest_cdc_id(self):
         with self.connector.get_session() as session:
@@ -84,6 +80,59 @@ class EmployeeCDCProducer:
         if max_cdc_id:
             self.update_latest_cdc_id(max_cdc_id)
         self.producer.flush()
+
+    def listen_for_cdc_events(self) -> None:
+        engine = self.connector.get_sql_engine()
+
+        raw_conn = engine.raw_connection()
+
+        dbapi_conn = (
+            raw_conn.driver_connection
+            if hasattr(raw_conn, "driver_connection")
+            else raw_conn.connection
+            if hasattr(raw_conn, "connection")
+            else raw_conn
+        )
+
+        dbapi_conn.set_isolation_level(
+            psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT
+        )
+
+        cursor = dbapi_conn.cursor()
+        cursor.execute("LISTEN emp_cdc_events;")
+
+        print("Listening for Postgres notifications on channel: emp_cdc_events")
+
+        try:
+            while True:
+                has_notification = select.select([dbapi_conn], [], [], 10)
+
+                if has_notification == ([], [], []):
+                    print("No notification. Running periodic CDC sweep.")
+                    self.publish_batch()
+                    continue
+
+                dbapi_conn.poll()
+
+                while dbapi_conn.notifies:
+                    notify = dbapi_conn.notifies.pop(0)
+
+                    print(
+                        f"Received CDC notification: "
+                        f"channel={notify.channel}, payload={notify.payload}"
+                    )
+
+                    self.publish_batch()
+
+        finally:
+            cursor.close()
+            raw_conn.close()
+
+    def run(self) -> None:
+        print("Employee CDC producer started.")
+
+        self.publish_batch()
+        self.listen_for_cdc_events()
 
 
 

@@ -1,9 +1,12 @@
+from datetime import datetime
+from sqlite3 import OperationalError
 from typing import Dict, Any
 
 from kafka import KafkaConsumer, KafkaProducer
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
-from app.config import POSTGRES_TGT_CONFIG, KAFKA_PRODUCER_CONFIG, KAFKA_CONSUMER_CONFIG, KAFKA_TOPIC
+from app.config import POSTGRES_TGT_CONFIG, KAFKA_PRODUCER_CONFIG, KAFKA_CONSUMER_CONFIG, KAFKA_TOPIC, KAFKA_DLQ_TOPIC
 from app.connector import PostgresConnector
 
 
@@ -12,17 +15,71 @@ class EmployeeCDCConsumer:
         self.connector = PostgresConnector(**POSTGRES_TGT_CONFIG)
 
         self.consumer = KafkaConsumer(KAFKA_TOPIC, **KAFKA_CONSUMER_CONFIG)
-        self.producer = KafkaProducer(**KAFKA_PRODUCER_CONFIG)
+        self.dlq_producer = KafkaProducer(**KAFKA_PRODUCER_CONFIG)
 
-    def validate_message(self, message: dict) -> None:
-        if message["emp_id"] is None or message["cdc_id"] is None or message["action"] is None:
-            raise ValueError(f"Invalid message: {message}")
+    def validate_event(self, event):
+        required_fields = [
+            "cdc_id",
+            "emp_id",
+            "action",
+        ]
 
-        if int(message["emp_id"]) <= 0:
+        for field in required_fields:
+            if field not in event:
+                raise ValueError(f"Missing required field: {field}")
+
+        if event["action"] not in ("INSERT", "UPDATE", "DELETE"):
+            raise ValueError(f"Invalid action: {event['action']}")
+
+        if int(event["emp_id"]) <= 0:
             raise ValueError("emp_id must be positive")
 
-        if message["action"] not in {"INSERT", "UPDATE", "DELETE"}:
-            raise ValueError(f"Unknown action: {message['action']}")
+        if event["action"] in ("INSERT", "UPDATE"):
+            employee_fields = [
+                "first_name",
+                "last_name",
+                "dob",
+                "city",
+                "salary",
+            ]
+
+            for field in employee_fields:
+                if field not in event:
+                    raise ValueError(f"Missing employee field: {field}")
+
+            if event["salary"] is not None and int(event["salary"]) < 0:
+                raise ValueError("salary cannot be negative")
+
+    def send_to_dlq(self, message, event, error):
+        dlq_message = {
+            "error": str(error),
+            "error_type": type(error).__name__,
+            "original_event": event,
+            "source_topic": message.topic,
+            "source_partition": message.partition,
+            "source_offset": message.offset,
+            "source_key": message.key,
+            "failed_at": datetime.utcnow().isoformat(),
+        }
+
+        key = event.get("emp_id", "unknown") if isinstance(event, dict) else "unknown"
+
+        future = self.dlq_producer.send(
+            KAFKA_DLQ_TOPIC,
+            key=key,
+            value=dlq_message,
+        )
+
+        future.get(timeout=10)
+        self.dlq_producer.flush()
+
+        print(
+            f"Sent message to DLQ: "
+            f"topic={message.topic}, "
+            f"partition={message.partition}, "
+            f"offset={message.offset}, "
+            f"error={error}"
+        )
 
     def apply_event(self, message: dict) -> None:
         if message["action"] == "INSERT" or message["action"] == "UPDATE":
@@ -66,15 +123,35 @@ class EmployeeCDCConsumer:
             session.commit()
 
     def run(self):
+        print("Employee CDC consumer started.")
+
         for message in self.consumer:
             event = message.value
-            print(event)
-            try:
-                self.validate_message(event)
-                self.apply_event(event)
-            except Exception as e:
-                raise e
 
+            try:
+                self.validate_event(event)
+                self.apply_event(event)
+
+                self.consumer.commit()
+
+                print(
+                    f"Applied event: "
+                    f"cdc_id={event.get('cdc_id')}, "
+                    f"emp_id={event.get('emp_id')}, "
+                    f"action={event.get('action')}"
+                )
+
+            except (OperationalError, DBAPIError) as error:
+                print(f"Database/system error. Will retry later. error={error}")
+                break
+
+            except ValueError as error:
+                self.send_to_dlq(message, event, error)
+                self.consumer.commit()
+
+            except Exception as error:
+                self.send_to_dlq(message, event, error)
+                self.consumer.commit()
 
 
 

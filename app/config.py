@@ -21,10 +21,14 @@ KAFKA_CONSUMER_CONFIG = {
     "bootstrap_servers": KAFKA_BOOTSTRAP_SERVER,
     "value_deserializer": lambda v: json.loads(v.decode("utf-8")),
     "key_deserializer": lambda k: k.decode("utf-8") if k else None,
-
+    "group_id": "employee_cdc_consumer_group",
 }
 
 KAFKA_TOPIC = "KafkaCDCProject"
+KAFKA_DLQ_TOPIC = "emp_cdc_dlq"
+
+
+
 POSTGRES_CONFIG = {
     'host': os.environ.get('POSTGRES_HOST', 'localhost'),
     'port': os.environ.get('POSTGRES_PORT', '5432'),
